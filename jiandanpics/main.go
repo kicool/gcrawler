@@ -1,10 +1,14 @@
 package main
 
 import (
+	"crypto/md5"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -14,14 +18,21 @@ import (
 
 const (
 	NCPU           = 4
+	JSONPATH       = "./info.json"
 	constSiteUrl   = "http://jandan.net/pic/page-%d#comments"
-	constRe        = `<p><img src="(.*jpg)" />`
+	constRe        = `<p><img src="(.*jpg)" />` // how PNG?
 	constBSizeId   = 1
 	constBSizePage = 1
 	constBSizePic  = 5
 )
 
-var wgQuit sync.WaitGroup
+type Item struct {
+	Hash []byte
+	Url  string
+	Size int
+}
+
+var info map[string]Item
 
 func main() {
 	start := time.Now()
@@ -30,14 +41,29 @@ func main() {
 	log.SetFlags(log.Lmicroseconds)
 	log.Println("START")
 
-	ids := genPageRange(690, 700)
+	conf := config{JSONPATH}
+	err := conf.Load(&info)
+	if err != nil {
+		log.Fatal("Load:", err)
+		os.Exit(1)
+	}
+
+	ids := genPageRange(60, 70)
 
 	pages := genPageUrls(ids)
 
 	pics := parsePicUrls(pages)
 
-	fetchPics(pics)
+	var wgQuit sync.WaitGroup
+	//handlePics(pics, wgQuit)
+	//logPicsUrl(pics, wgQuit)
+	fetchPics3(pics, &wgQuit) //must use pointer 
 	wgQuit.Wait()
+
+	err = conf.Save(&info)
+	if err != nil {
+		log.Fatal("Save:", err)
+	}
 
 	log.Println("END:", time.Since(start))
 }
@@ -75,8 +101,6 @@ func genPageUrls(ids <-chan int) <-chan string {
 func parsePicUrls(in <-chan string) <-chan string {
 	out := make(chan string, constBSizePic)
 	go func() {
-		//var wg sync.WaitGroup
-
 		for {
 			page := <-in
 			if len(page) == 0 { //quit msg
@@ -120,12 +144,126 @@ func parsePicUrls(in <-chan string) <-chan string {
 	return out
 }
 
-func fetchPics(in <-chan string) {
+func logPicsUrl(in <-chan string, wg sync.WaitGroup) {
+	site := make(map[string]uint64)
+	for {
+		picUrl := <-in
+		if len(picUrl) == 0 { //quit msg
+			break
+		}
+		u, _ := url.Parse(picUrl)
+		site[u.Host]++
+		log.Println("logPicsUrl:", u.Host, site[u.Host])
+	}
+	log.Println("Q:logPicsUrl:", site)
+}
+
+func fetchPics2(in <-chan string, wg *sync.WaitGroup) {
 	var i = 0
 	for {
 		picUrl := <-in
 		if len(picUrl) == 0 { //quit msg
 			break
+		}
+		_, ok := info[picUrl]
+		if ok {
+			log.Println("PicUrlsExit:", picUrl)
+			continue
+		}
+		log.Println("PicUrls  IN:", picUrl)
+
+		resp, err := http.Get(picUrl)
+		if err != nil {
+			log.Println("download", err)
+			continue
+		}
+		log.Println("Get Finshed:", picUrl)
+		defer resp.Body.Close()
+
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			log.Println("ioutil.ReadAll:", err)
+			continue
+		}
+
+		log.Println("Hash       :", picUrl)
+		it := Item{Url: picUrl}
+		filename := hashPic(body, &it)
+
+		path, _ := filepath.Abs(fmt.Sprintf("./pics/%s.jpg", filename))
+		log.Println("Write      :", picUrl, path)
+		err = ioutil.WriteFile(path, body, 0)
+		if err != nil {
+			log.Fatal("ioutil.WriteFile", err)
+			continue
+		}
+		log.Println("Write    OK:", picUrl, path)
+
+		i++
+	}
+	log.Println("Q:fetchPics")
+
+}
+
+func fetchPics3(in <-chan string, wg *sync.WaitGroup) {
+	var i = 0
+	for {
+		picUrl := <-in
+		if len(picUrl) == 0 { //quit msg
+			break
+		}
+		_, ok := info[picUrl]
+		if ok {
+			log.Println("PicUrlsExit:", picUrl)
+			continue
+		}
+		log.Println("PicUrls  IN:", picUrl)
+
+		func() {
+			resp, err := http.Get(picUrl)
+			if err != nil {
+				log.Println("download", err)
+				return
+			}
+			log.Println("Get Finshed:", picUrl)
+			defer resp.Body.Close()
+
+			body, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				log.Println("ioutil.ReadAll:", err)
+				return
+			}
+
+			log.Println("Hash       :", picUrl)
+			it := Item{Url: picUrl}
+			filename := hashPic(body, &it)
+
+			path, _ := filepath.Abs(fmt.Sprintf("./pics/%s.jpg", filename))
+			log.Println("Write      :", picUrl, path)
+			err = ioutil.WriteFile(path, body, 0)
+			if err != nil {
+				log.Fatal("ioutil.WriteFile", err)
+				return
+			}
+			log.Println("Write    OK:", picUrl, path)
+		}()
+		i++
+	}
+	log.Println("Q:fetchPics")
+
+}
+
+func fetchPics(in <-chan string, wg *sync.WaitGroup) {
+	var i = 0
+	for {
+		picUrl := <-in
+		if len(picUrl) == 0 { //quit msg
+			break
+		}
+		_, ok := info[picUrl]
+		if ok {
+			log.Println("PicUrlsExit:", picUrl)
+			continue
 		}
 		log.Println("PicUrls  IN:", picUrl)
 
@@ -136,17 +274,17 @@ func fetchPics(in <-chan string) {
 		}
 		log.Println("Get Finshed:", picUrl)
 
-		wgQuit.Add(1)
-		go writePic(resp, picUrl, i)
+		wg.Add(1)
+		go writePic(resp, picUrl, wg)
 
 		i++
 	}
 	log.Println("Q:fetchPics")
 }
 
-func writePic(resp *http.Response, picUrl string, i int) {
+func writePic(resp *http.Response, picUrl string, wg *sync.WaitGroup) {
 	defer resp.Body.Close()
-	defer wgQuit.Done()
+	defer wg.Done()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -154,17 +292,29 @@ func writePic(resp *http.Response, picUrl string, i int) {
 		return
 	}
 
-	path, _ := filepath.Abs(fmt.Sprintf("./pics/%d.jpg", i))
+	log.Println("Hash       :", picUrl)
+	i := Item{Url: picUrl}
+	filename := hashPic(body, &i)
+
+	path, _ := filepath.Abs(fmt.Sprintf("./pics/%s.jpg", filename))
 	log.Println("Write      :", picUrl, path)
 	err = ioutil.WriteFile(path, body, 0)
 	if err != nil {
-		log.Println("ioutil.WriteFile", err)
+		log.Fatal("ioutil.WriteFile", err)
 		return
 	}
 	log.Println("Write    OK:", picUrl, path)
 }
 
-func writeDuck(resp *http.Response, picUrl string, i int) {
+func writeDuck(resp *http.Response, picUrl string, wg *sync.WaitGroup) {
 	defer resp.Body.Close()
-	defer wgQuit.Done()
+	defer wg.Done()
+}
+
+func hashPic(b []byte, i *Item) string {
+	h := md5.New()
+	i.Size, _ = io.WriteString(h, string(b))
+	i.Hash = h.Sum(nil)
+	info[i.Url] = *i
+	return fmt.Sprintf("%x", i.Hash)
 }
